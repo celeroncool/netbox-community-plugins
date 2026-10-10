@@ -4,17 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       netbox_version:
-        description: "NetBox tag (empty = use NETBOX_VERSION file)"
+        description: "NetBox tag, e.g. v4.6.0 (empty = versions.env)"
         required: false
-      netbox_docker_ref:
-        description: "netbox-docker ref (branch/tag)"
+      netbox_docker_version:
+        description: "netbox-docker tag, e.g. 5.0.2 (empty = versions.env)"
         required: false
-        default: release
   push:
     branches: [main]
-    paths: [NETBOX_VERSION, Dockerfile-Plugins, plugin_requirements.txt, configuration/**]
+    paths: [versions.env, Dockerfile-Plugins, plugin_requirements.txt, configuration/**]
   schedule:
-    - cron: "0 4 * * 1"   # weekly rebuild of the pinned version (base image/OS patches)
+    - cron: "0 4 * * 1"   # weekly rebuild of the pinned pair (OS/base patches)
 
 permissions:
   contents: read
@@ -33,27 +32,33 @@ jobs:
       - name: Resolve versions
         id: ver
         env:
-          INPUT_VERSION: ${{ inputs.netbox_version }}
-          INPUT_DOCKER_REF: ${{ inputs.netbox_docker_ref }}
+          IN_NB: ${{ inputs.netbox_version }}
+          IN_ND: ${{ inputs.netbox_docker_version }}
         run: |
-          v="${INPUT_VERSION:-$(tr -d '[:space:]' < NETBOX_VERSION)}"
-          [[ "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid NetBox version: '$v'"; exit 1; }
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "docker_ref=${INPUT_DOCKER_REF:-release}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          source versions.env
+          nb="${IN_NB:-$NETBOX_VERSION}"
+          nd="${IN_ND:-$NETBOX_DOCKER_VERSION}"
+          [[ "$nb" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid NetBox version: $nb"; exit 1; }
+          [[ "$nd" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]  || { echo "Invalid netbox-docker version: $nd"; exit 1; }
+          echo "netbox=$nb"        >> "$GITHUB_OUTPUT"
+          echo "netbox_docker=$nd" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout netbox-docker
+      - name: Checkout netbox-docker (pinned tag)
         uses: actions/checkout@v4
         with:
           repository: netbox-community/netbox-docker
-          ref: ${{ steps.ver.outputs.docker_ref }}
+          ref: ${{ steps.ver.outputs.netbox_docker }}
           path: netbox-docker
 
-      - name: Build base image (pinned NetBox version)
+      - name: Build base image
         working-directory: netbox-docker
         env:
           IMAGE_NAMES: netbox-base
           TAG: base
-        run: ./build.sh "${{ steps.ver.outputs.version }}"
+        run: |
+          ./build.sh "${{ steps.ver.outputs.netbox }}"
+          docker image inspect netbox-base:base >/dev/null
 
       - name: Inject custom plugin files
         run: |
@@ -72,9 +77,9 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=${{ steps.ver.outputs.version }}
-            type=raw,value=${{ steps.ver.outputs.version }}-{{date 'YYYYMMDD'}}
-            type=sha,prefix=${{ steps.ver.outputs.version }}-
+            type=raw,value=${{ steps.ver.outputs.netbox }}-${{ steps.ver.outputs.netbox_docker }}
+            type=raw,value=${{ steps.ver.outputs.netbox }}-${{ steps.ver.outputs.netbox_docker }}-{{date 'YYYYMMDD'}}
+            type=sha,prefix=${{ steps.ver.outputs.netbox }}-${{ steps.ver.outputs.netbox_docker }}-
 
       - name: Build & push plugin image
         uses: docker/build-push-action@v6

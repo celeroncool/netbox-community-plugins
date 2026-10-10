@@ -1,0 +1,87 @@
+name: Build custom NetBox image
+
+on:
+  workflow_dispatch:
+    inputs:
+      netbox_version:
+        description: "NetBox tag (empty = use NETBOX_VERSION file)"
+        required: false
+      netbox_docker_ref:
+        description: "netbox-docker ref (branch/tag)"
+        required: false
+        default: release
+  push:
+    branches: [main]
+    paths: [NETBOX_VERSION, Dockerfile-Plugins, plugin_requirements.txt, configuration/**]
+  schedule:
+    - cron: "0 4 * * 1"   # weekly rebuild of the pinned version (base image/OS patches)
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (custom plugins)
+        uses: actions/checkout@v4
+
+      - name: Resolve versions
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.netbox_version }}
+          INPUT_DOCKER_REF: ${{ inputs.netbox_docker_ref }}
+        run: |
+          v="${INPUT_VERSION:-$(tr -d '[:space:]' < NETBOX_VERSION)}"
+          [[ "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid NetBox version: '$v'"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "docker_ref=${INPUT_DOCKER_REF:-release}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout netbox-docker
+        uses: actions/checkout@v4
+        with:
+          repository: netbox-community/netbox-docker
+          ref: ${{ steps.ver.outputs.docker_ref }}
+          path: netbox-docker
+
+      - name: Build base image (pinned NetBox version)
+        working-directory: netbox-docker
+        env:
+          IMAGE_NAMES: netbox-base
+          TAG: base
+        run: ./build.sh "${{ steps.ver.outputs.version }}"
+
+      - name: Inject custom plugin files
+        run: |
+          cp Dockerfile-Plugins plugin_requirements.txt netbox-docker/
+          cp configuration/plugins.py netbox-docker/configuration/plugins.py
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags/labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=${{ steps.ver.outputs.version }}-{{date 'YYYYMMDD'}}
+            type=sha,prefix=${{ steps.ver.outputs.version }}-
+
+      - name: Build & push plugin image
+        uses: docker/build-push-action@v6
+        with:
+          context: netbox-docker
+          file: netbox-docker/Dockerfile-Plugins
+          build-args: BASE=netbox-base:base
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
